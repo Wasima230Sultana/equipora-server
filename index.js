@@ -10,9 +10,7 @@ const port = process.env.PORT || 5000;
 app.use(express.json());
 app.use(cors());
 
-
-const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-bl6n1e4-shard-00-00.6tutdbk.mongodb.net:27017,ac-bl6n1e4-shard-00-01.6tutdbk.mongodb.net:27017,ac-bl6n1e4-shard-00-02.6tutdbk.mongodb.net:27017/?ssl=true&replicaSet=atlas-36159o-shard-0&authSource=admin`)
-
+const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-bl6n1e4-shard-00-00.6tutdbk.mongodb.net:27017,ac-bl6n1e4-shard-00-01.6tutdbk.mongodb.net:27017,ac-bl6n1e4-shard-00-02.6tutdbk.mongodb.net:27017/?ssl=true&replicaSet=atlas-36159o-shard-0&authSource=admin`);
 
 export async function connectToMongoDB() {
     try {
@@ -26,14 +24,120 @@ export async function connectToMongoDB() {
 
 const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("equipora");
+const users = database.collection("user");
+const equipmentCollection = database.collection("equipment");
+const rentalsCollection = database.collection("rentals");
+
 app.get('/', (req, res) => {
     res.send('equipora is looping')
 })
+
+app.get('/user', async (req, res) => {
+    const cursor = users.find({});
+    const result = await cursor.toArray();
+    res.send(result);
+})
+
+// ---------------------------------------------------------------------------
+// Owner equipment API (backend only - no UI code lives here)
+// The client sends the owner id in the URL; we verify it against the user
+// collection before touching any equipment or rental data.
+// ---------------------------------------------------------------------------
+
+const editableFields = [
+    "name", "description", "category", "location", "rentalPrice",
+    "rentalType", "availableQuantity", "condition", "brand", "model",
+    "image", "terms"
+];
+
+function toEquipment(doc, owner) {
+    const { _id, ...fields } = doc;
+    return { ...fields, id: _id.toHexString(), owner };
+}
+
+function toRental(doc) {
+    const { _id, ...fields } = doc;
+    return { ...fields, id: _id.toHexString() };
+}
+
+function readInput(body) {
+    if (!body?.name?.trim() || !body.category || Number(body.rentalPrice) <= 0) {
+        return null;
+    }
+    return {
+        name: body.name.trim(),
+        description: typeof body.description === "string" ? body.description : "",
+        category: body.category,
+        location: typeof body.location === "string" ? body.location : "",
+        rentalPrice: Number(body.rentalPrice),
+        rentalType: body.rentalType || "Daily",
+        availableQuantity: Number(body.availableQuantity ?? 1),
+        condition: body.condition || "Good",
+        brand: typeof body.brand === "string" ? body.brand : "",
+        model: typeof body.model === "string" ? body.model : "",
+        image: typeof body.image === "string" ? body.image : "",
+        terms: typeof body.terms === "string" ? body.terms : "",
+    };
+}
+
+function readPatch(body) {
+    const patch = {};
+    for (const field of editableFields) {
+        if (body?.[field] !== undefined) patch[field] = body[field];
+    }
+    return patch;
+}
+
+async function checkOwnerId(req, res, next) {
+    const ownerId = req.params.ownerId;
+    console.log("[Backend] checking owner id:", ownerId);
+
+    if (!ObjectId.isValid(ownerId)) {
+        console.warn("[Backend] invalid owner id");
+        return res.status(400).json({ error: "Invalid owner id." });
+    }
+
+    const user = await users.findOne({ _id: new ObjectId(ownerId), role: "owner" });
+    if (!user) {
+        console.warn("[Backend] owner not found");
+        return res.status(403).json({ error: "Owner not found." });
+    }
+
+    req.owner = {
+        id: ownerId,
+        name: user.name ?? "",
+        email: user.email ?? "",
+        phone: user.phone ?? "",
+        company: user.company ?? "",
+    };
+    console.log("[Backend] owner verified:", user.email);
+    next();
+}
+
+async function findOwnedEquipment(req, res) {
+    const id = req.params.id;
+    if (!ObjectId.isValid(id)) {
+        console.warn("[Backend] invalid equipment id:", id);
+        res.status(400).json({ error: "Invalid equipment id." });
+        return null;
+    }
+    const doc = await equipmentCollection.findOne({
+        _id: new ObjectId(id),
+        ownerId: req.owner.id,
+    });
+    if (!doc) {
+        console.warn("[Backend] equipment not found:", id);
+        res.status(404).json({ error: "Equipment not found." });
+        return null;
+    }
+    console.log("[Backend] equipment lookup:", id, "found");
+    return doc;
+}
+
 
 
 app.listen(port, () => {
     console.log(`equipora is running on port ${port}`)
 })
-
 
 export default app;
