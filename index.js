@@ -232,7 +232,86 @@ app.get('/owner/:ownerId/rentals', checkOwnerId, async (req, res) => {
     res.json({ rentals: docs.map(toRental) });
 });
 
+// ---------------------------------------------------------------------------
+// Customer rentals & favorites (backend only)
+// ---------------------------------------------------------------------------
 
+async function checkCustomerId(req, res, next) {
+    const customerId = req.params.customerId;
+    console.log("[Backend] checking customer id:", customerId);
+
+    if (!ObjectId.isValid(customerId)) {
+        return res.status(400).json({ error: "Invalid customer id." });
+    }
+    const user = await users.findOne({ _id: new ObjectId(customerId), role: "customer" });
+    if (!user) {
+        console.warn("[Backend] customer not found");
+        return res.status(403).json({ error: "Customer not found." });
+    }
+    req.customerId = customerId;
+    console.log("[Backend] customer verified:", user.email);
+    next();
+}
+
+function toCustomerRental(doc) {
+    const { _id, ...fields } = doc;
+    return { ...fields, id: _id.toHexString() };
+}
+
+// All rental bookings made by this customer.
+app.get('/customer/:customerId/rentals', checkCustomerId, async (req, res) => {
+    console.log("[Backend] GET customer rentals");
+    const docs = await rentalsCollection
+        .find({ customerId: req.customerId })
+        .sort({ bookingDate: -1 })
+        .toArray();
+    console.log("[Backend] customer rentals ->", docs.length, "booking(s)");
+    res.json({ rentals: docs.map(toCustomerRental) });
+});
+
+// Favorite equipment of this customer, joined with the equipment records.
+app.get('/customer/:customerId/favorites', checkCustomerId, async (req, res) => {
+    console.log("[Backend] GET customer favorites");
+    const favorites = await favoritesCollection.find({ customerId: req.customerId }).toArray();
+    const ids = favorites
+        .map((favorite) => ObjectId.isValid(favorite.equipmentId) ? new ObjectId(favorite.equipmentId) : null)
+        .filter(Boolean);
+
+    if (ids.length === 0) {
+        console.log("[Backend] no favorites yet");
+        return res.json({ favorites: [] });
+    }
+    const docs = await equipmentCollection.find({ _id: { $in: ids } }).toArray();
+    console.log("[Backend] favorites ->", docs.length, "item(s)");
+    res.json({ favorites: docs.map((doc) => toEquipment(doc, null)) });
+});
+
+// Add a favorite (kept here so the favorites table can be populated).
+app.post('/customer/:customerId/favorites/:equipmentId', checkCustomerId, async (req, res) => {
+    console.log("[Backend] POST favorite", req.params.equipmentId);
+    if (!ObjectId.isValid(req.params.equipmentId)) {
+        return res.status(400).json({ error: "Invalid equipment id." });
+    }
+    await favoritesCollection.updateOne(
+        { customerId: req.customerId, equipmentId: req.params.equipmentId },
+        { $setOnInsert: { createdAt: new Date().toISOString() } },
+        { upsert: true }
+    );
+    res.status(201).json({ success: true });
+});
+
+// Remove a favorite.
+app.delete('/customer/:customerId/favorites/:equipmentId', checkCustomerId, async (req, res) => {
+    console.log("[Backend] DELETE favorite", req.params.equipmentId);
+    const result = await favoritesCollection.deleteOne({
+        customerId: req.customerId,
+        equipmentId: req.params.equipmentId,
+    });
+    if (result.deletedCount === 0) {
+        return res.status(404).json({ error: "Favorite not found." });
+    }
+    res.json({ success: true });
+});
 
 // ---------------------------------------------------------------------------
 // Profile (shared by customer, owner and admin)
