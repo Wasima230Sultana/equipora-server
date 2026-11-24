@@ -27,6 +27,7 @@ const database = connectedClient.db("equipora");
 const users = database.collection("user");
 const equipmentCollection = database.collection("equipment");
 const rentalsCollection = database.collection("rentals");
+const favoritesCollection = database.collection("favorites");
 
 app.get('/', (req, res) => {
     res.send('equipora is looping')
@@ -229,6 +230,79 @@ app.get('/owner/:ownerId/rentals', checkOwnerId, async (req, res) => {
         .toArray();
     console.log("[Backend] rentals ->", docs.length, "booking(s)");
     res.json({ rentals: docs.map(toRental) });
+});
+
+
+
+// ---------------------------------------------------------------------------
+// Profile (shared by customer, owner and admin)
+// ---------------------------------------------------------------------------
+
+async function checkUserId(req, res, next) {
+    const userId = req.params.userId;
+    console.log("[Backend] checking user id:", userId);
+
+    if (!ObjectId.isValid(userId)) {
+        return res.status(400).json({ error: "Invalid user id." });
+    }
+    const user = await users.findOne({ _id: new ObjectId(userId) });
+    if (!user) {
+        console.warn("[Backend] user not found");
+        return res.status(403).json({ error: "User not found." });
+    }
+    req.userDoc = user;
+    next();
+}
+
+function toProfile(user) {
+    return {
+        id: user._id.toHexString(),
+        name: user.name ?? "",
+        email: user.email ?? "",
+        image: user.image ?? "",
+        phone: user.phone ?? "",
+        address: user.address ?? "",
+        role: user.role ?? "",
+    };
+}
+
+function readProfilePatch(body) {
+    const patch = {};
+    for (const field of ["name", "email", "image", "phone", "address"]) {
+        if (typeof body?.[field] === "string") patch[field] = body[field].trim();
+    }
+    if ("name" in patch && !patch.name) return null;
+    if ("email" in patch && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(patch.email)) return null;
+    return patch;
+}
+
+app.get('/profile/:userId', checkUserId, (req, res) => {
+    console.log("[Backend] GET profile");
+    res.json({ profile: toProfile(req.userDoc) });
+});
+
+app.patch('/profile/:userId', checkUserId, async (req, res) => {
+    console.log("[Backend] PATCH profile");
+    const patch = readProfilePatch(req.body);
+    if (!patch || Object.keys(patch).length === 0) {
+        return res.status(400).json({ error: "No valid profile fields were provided." });
+    }
+    if (patch.email) {
+        const duplicate = await users.findOne({
+            email: patch.email,
+            _id: { $ne: req.userDoc._id },
+        });
+        if (duplicate) {
+            return res.status(409).json({ error: "That email is already in use." });
+        }
+    }
+    await users.updateOne(
+        { _id: req.userDoc._id },
+        { $set: { ...patch, updatedAt: new Date() } }
+    );
+    console.log("[Backend] profile updated:", req.params.userId);
+    const updated = await users.findOne({ _id: req.userDoc._id });
+    res.json({ profile: toProfile(updated) });
 });
 
 app.listen(port, () => {
