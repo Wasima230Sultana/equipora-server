@@ -134,7 +134,102 @@ async function findOwnedEquipment(req, res) {
     return doc;
 }
 
+// Owner info for the Add Equipment form.
+app.get('/owner/:ownerId', checkOwnerId, (req, res) => {
+    console.log("[Backend] GET owner info");
+    res.json({ owner: req.owner });
+});
 
+// All equipment belonging to this owner.
+app.get('/owner/:ownerId/equipment', checkOwnerId, async (req, res) => {
+    console.log("[Backend] GET equipment list");
+    const docs = await equipmentCollection
+        .find({ ownerId: req.owner.id })
+        .sort({ createdAt: -1 })
+        .toArray();
+    console.log("[Backend] equipment list ->", docs.length, "item(s)");
+    res.json({
+        owner: req.owner,
+        equipment: docs.map((doc) => toEquipment(doc, req.owner)),
+    });
+});
+
+// Add a listing - new listings always start as Pending.
+app.post('/owner/:ownerId/equipment', checkOwnerId, async (req, res) => {
+    console.log("[Backend] POST equipment");
+    const input = readInput(req.body);
+    if (!input) {
+        console.warn("[Backend] POST validation failed");
+        return res.status(400).json({ error: "Name, category and a valid rental price are required." });
+    }
+    const doc = {
+        ...input,
+        ownerId: req.owner.id,
+        status: "Pending",
+        createdAt: new Date().toISOString(),
+    };
+    const result = await equipmentCollection.insertOne(doc);
+    console.log("[Backend] equipment created:", result.insertedId.toHexString());
+    res.status(201).json({ equipment: toEquipment({ ...doc, _id: result.insertedId }, req.owner) });
+});
+
+// Full details of one listing.
+app.get('/owner/:ownerId/equipment/:id', checkOwnerId, async (req, res) => {
+    console.log("[Backend] GET equipment details");
+    const doc = await findOwnedEquipment(req, res);
+    if (!doc) return;
+    res.json({ equipment: toEquipment(doc, req.owner) });
+});
+
+// Update a listing (status is intentionally not editable here).
+app.patch('/owner/:ownerId/equipment/:id', checkOwnerId, async (req, res) => {
+    console.log("[Backend] PATCH equipment");
+    const existing = await findOwnedEquipment(req, res);
+    if (!existing) return;
+
+    const patch = readPatch(req.body);
+    if (Object.keys(patch).length === 0) {
+        console.warn("[Backend] PATCH has no editable fields");
+        return res.status(400).json({ error: "No editable fields were provided." });
+    }
+    await equipmentCollection.updateOne(
+        { _id: existing._id, ownerId: req.owner.id },
+        { $set: patch }
+    );
+    console.log("[Backend] equipment updated:", req.params.id);
+    const updated = await equipmentCollection.findOne({ _id: existing._id });
+    res.json({ equipment: toEquipment(updated, req.owner) });
+});
+
+// Delete a listing.
+app.delete('/owner/:ownerId/equipment/:id', checkOwnerId, async (req, res) => {
+    console.log("[Backend] DELETE equipment");
+    const existing = await findOwnedEquipment(req, res);
+    if (!existing) return;
+    await equipmentCollection.deleteOne({ _id: existing._id, ownerId: req.owner.id });
+    console.log("[Backend] equipment deleted:", req.params.id);
+    res.json({ success: true });
+});
+
+// Bookings against this owner's equipment.
+app.get('/owner/:ownerId/rentals', checkOwnerId, async (req, res) => {
+    console.log("[Backend] GET owner rentals");
+    const owned = await equipmentCollection
+        .find({ ownerId: req.owner.id }, { projection: { _id: 1 } })
+        .toArray();
+    const ownedIds = owned.map((item) => item._id.toHexString());
+
+    if (ownedIds.length === 0) {
+        console.log("[Backend] no equipment -> no rentals");
+        return res.json({ rentals: [] });
+    }
+
+    const docs = await rentalsCollection
+        .find({ equipmentId: { $in: ownedIds } })
+        .toArray();
+    console.log("[Backend] rentals ->", docs.length, "booking(s)");
+    res.json({ rentals: docs.map(toRental) });
+});
 
 app.listen(port, () => {
     console.log(`equipora is running on port ${port}`)
