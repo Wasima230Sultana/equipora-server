@@ -29,6 +29,10 @@ const equipmentCollection = database.collection("equipment");
 const rentalsCollection = database.collection("rentals");
 const favoritesCollection = database.collection("favorites");
 
+// Status values accepted from the payment flow and the admin dashboard.
+const PAYMENT_STATUSES = ["Paid", "Pending", "Failed", "Refunded"];
+const BOOKING_STATUSES = ["Pending", "Confirmed", "Active", "Completed", "Cancelled"];
+
 app.get('/', (req, res) => {
     res.send('equipora is looping')
 })
@@ -169,6 +173,24 @@ app.get('/equipment', async (req, res) => {
     const docs = await equipmentCollection.find(query).sort(sort).toArray();
     console.log("[Backend] browse equipment ->", docs.length, "item(s)");
     res.json({ equipment: await attachOwners(docs) });
+})
+
+// Featured approved listings for the homepage. The limit is applied in MongoDB.
+app.get('/equipment/featured', async (req, res) => {
+    const requested = Number(req.query.limit);
+    const limit = Number.isFinite(requested) && requested > 0
+        ? Math.min(Math.floor(requested), 12)
+        : 6;
+
+    const docs = await equipmentCollection
+        .find({ status: "Approved" })
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .toArray();
+
+    const equipment = await attachOwners(docs);
+    console.log("[Backend] featured equipment ->", equipment.length, "item(s)");
+    res.json({ equipment });
 })
 
 // Full details of one listing. Access is restricted in the UI to signed-in users.
@@ -423,6 +445,7 @@ app.post('/customer/:customerId/rentals', checkCustomerId, async (req, res) => {
         rentalStartDate: start.toISOString(),
         rentalEndDate: end.toISOString(),
         bookingDate: new Date().toISOString(),
+        requiredQuantity: quantity,
         totalAmount: days * Number(equipment.rentalPrice) * quantity,
         paymentStatus: "Pending",
         bookingStatus: "Pending",
@@ -430,6 +453,76 @@ app.post('/customer/:customerId/rentals', checkCustomerId, async (req, res) => {
     const result = await rentalsCollection.insertOne(doc);
     console.log("[Backend] booking created:", result.insertedId.toHexString());
     res.status(201).json({ rental: toCustomerRental({ ...doc, _id: result.insertedId }) });
+});
+
+// ---------------------------------------------------------------------------
+// Stripe payment confirmation (server-to-server calls from the Next.js app)
+// ---------------------------------------------------------------------------
+
+// Only the Next.js route handlers know this shared secret. A browser cannot
+// call the payment update endpoint without it.
+function checkInternalRequest(req, res, next) {
+    const secret = process.env.INTERNAL_API_SECRET;
+    if (!secret || req.get('x-internal-secret') !== secret) {
+        console.warn("[Backend] rejected payment update: missing/invalid internal secret");
+        return res.status(401).json({ error: "Unauthorized payment update." });
+    }
+    next();
+}
+
+function toCustomerContact(user) {
+    return {
+        name: user?.name ?? "",
+        email: user?.email ?? "",
+        phone: user?.phone ?? "",
+        address: user?.address ?? "",
+    };
+}
+
+// One rental plus the customer details shown on the payment success page.
+app.get('/customer/:customerId/rentals/:rentalId', checkCustomerId, async (req, res) => {
+    if (!ObjectId.isValid(req.params.rentalId)) {
+        return res.status(400).json({ error: "Invalid rental id." });
+    }
+    const doc = await rentalsCollection.findOne({
+        _id: new ObjectId(req.params.rentalId),
+        customerId: req.customerId,
+    });
+    if (!doc) return res.status(404).json({ error: "Rental not found." });
+
+    const user = await users.findOne(
+        { _id: new ObjectId(req.customerId) },
+        { projection: { name: 1, email: 1, phone: 1, address: 1 } }
+    );
+    console.log("[Backend] GET customer rental:", req.params.rentalId);
+    res.json({ rental: { ...toCustomerRental(doc), customer: toCustomerContact(user) } });
+});
+
+// Mark a rental as paid (or cancelled) after Stripe confirms the payment.
+// Safe to call more than once: every field is set to the same final value.
+app.patch('/customer/:customerId/rentals/:rentalId/payment', checkCustomerId, checkInternalRequest, async (req, res) => {
+    const body = req.body ?? {};
+    const patch = {};
+
+    if (PAYMENT_STATUSES.includes(body.paymentStatus)) patch.paymentStatus = body.paymentStatus;
+    if (BOOKING_STATUSES.includes(body.bookingStatus)) patch.bookingStatus = body.bookingStatus;
+    if (typeof body.paymentIntentId === "string") patch.stripePaymentIntentId = body.paymentIntentId;
+    if (typeof body.currency === "string") patch.currency = body.currency;
+    if (typeof body.paidAmount === "number" && Number.isFinite(body.paidAmount)) patch.paidAmount = body.paidAmount;
+
+    if (!ObjectId.isValid(req.params.rentalId) || Object.keys(patch).length === 0) {
+        return res.status(400).json({ error: "No valid payment fields were provided." });
+    }
+
+    const result = await rentalsCollection.updateOne(
+        { _id: new ObjectId(req.params.rentalId), customerId: req.customerId },
+        { $set: patch }
+    );
+    if (!result.matchedCount) return res.status(404).json({ error: "Rental not found." });
+
+    const updated = await rentalsCollection.findOne({ _id: new ObjectId(req.params.rentalId) });
+    console.log("[Backend] rental payment updated:", req.params.rentalId, patch.paymentStatus ?? "");
+    res.json({ rental: toCustomerRental(updated) });
 });
 
 // Favorite equipment of this customer, joined with the equipment records.
@@ -518,8 +611,6 @@ function toAdminUser(user) {
 }
 
 const ADMIN_ROLES = ["customer", "owner", "admin"];
-const PAYMENT_STATUSES = ["Paid", "Pending", "Failed", "Refunded"];
-const BOOKING_STATUSES = ["Pending", "Confirmed", "Active", "Completed", "Cancelled"];
 
 // Users: list, change role, remove account.
 app.get('/admin/:adminId/users', checkAdminId, async (req, res) => {
