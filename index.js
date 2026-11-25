@@ -463,6 +463,10 @@ app.post('/customer/:customerId/rentals', checkCustomerId, async (req, res) => {
         paymentStatus: "Pending",
         bookingStatus: "Pending",
     };
+    // The Stripe Checkout Session id is bound to this rental at creation.
+    if (typeof req.body?.stripeSessionId === "string") {
+        doc.stripeSessionId = req.body.stripeSessionId;
+    }
     const result = await rentalsCollection.insertOne(doc);
     console.log("[Backend] booking created:", result.insertedId.toHexString());
     res.status(201).json({ rental: toCustomerRental({ ...doc, _id: result.insertedId }) });
@@ -471,17 +475,6 @@ app.post('/customer/:customerId/rentals', checkCustomerId, async (req, res) => {
 // ---------------------------------------------------------------------------
 // Stripe payment confirmation (server-to-server calls from the Next.js app)
 // ---------------------------------------------------------------------------
-
-// Only the Next.js route handlers know this shared secret. A browser cannot
-// call the payment update endpoint without it.
-function checkInternalRequest(req, res, next) {
-    const secret = process.env.INTERNAL_API_SECRET;
-    if (!secret || req.get('x-internal-secret') !== secret) {
-        console.warn("[Backend] rejected payment update: missing/invalid internal secret");
-        return res.status(401).json({ error: "Unauthorized payment update." });
-    }
-    next();
-}
 
 function toCustomerContact(user) {
     return {
@@ -512,26 +505,40 @@ app.get('/customer/:customerId/rentals/:rentalId', checkCustomerId, async (req, 
 });
 
 // Mark a rental as paid (or cancelled) after Stripe confirms the payment.
-// Safe to call more than once: every field is set to the same final value.
-app.patch('/customer/:customerId/rentals/:rentalId/payment', checkCustomerId, checkInternalRequest, async (req, res) => {
+// Security check: the caller must send the Stripe Checkout Session id that was
+// stored on the rental when checkout started. Nothing else is used to authorize.
+app.patch('/customer/:customerId/rentals/:rentalId/payment', checkCustomerId, async (req, res) => {
     const body = req.body ?? {};
-    const patch = {};
 
+    if (!ObjectId.isValid(req.params.rentalId)) {
+        return res.status(400).json({ error: "Invalid rental id." });
+    }
+    const rental = await rentalsCollection.findOne({
+        _id: new ObjectId(req.params.rentalId),
+        customerId: req.customerId,
+    });
+    if (!rental) return res.status(404).json({ error: "Rental not found." });
+
+    if (!body.sessionId || body.sessionId !== rental.stripeSessionId) {
+        console.warn("[Backend] rejected payment update: session id mismatch");
+        return res.status(401).json({ error: "Invalid payment session." });
+    }
+
+    const patch = {};
     if (PAYMENT_STATUSES.includes(body.paymentStatus)) patch.paymentStatus = body.paymentStatus;
     if (BOOKING_STATUSES.includes(body.bookingStatus)) patch.bookingStatus = body.bookingStatus;
     if (typeof body.paymentIntentId === "string") patch.stripePaymentIntentId = body.paymentIntentId;
     if (typeof body.currency === "string") patch.currency = body.currency;
     if (typeof body.paidAmount === "number" && Number.isFinite(body.paidAmount)) patch.paidAmount = body.paidAmount;
 
-    if (!ObjectId.isValid(req.params.rentalId) || Object.keys(patch).length === 0) {
+    if (Object.keys(patch).length === 0) {
         return res.status(400).json({ error: "No valid payment fields were provided." });
     }
 
-    const result = await rentalsCollection.updateOne(
+    await rentalsCollection.updateOne(
         { _id: new ObjectId(req.params.rentalId), customerId: req.customerId },
         { $set: patch }
     );
-    if (!result.matchedCount) return res.status(404).json({ error: "Rental not found." });
 
     const updated = await rentalsCollection.findOne({ _id: new ObjectId(req.params.rentalId) });
     console.log("[Backend] rental payment updated:", req.params.rentalId, patch.paymentStatus ?? "");
