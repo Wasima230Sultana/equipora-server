@@ -40,6 +40,37 @@ app.get('/user', async (req, res) => {
 })
 
 // ---------------------------------------------------------------------------
+// Recent uploads (shared by every dashboard role)
+// Returns the most recently added equipment across all owners, newest first.
+// ---------------------------------------------------------------------------
+app.get('/equipment/recent', async (req, res) => {
+    const requested = Number(req.query.limit);
+    const limit = Number.isFinite(requested) && requested > 0
+        ? Math.min(Math.floor(requested), 20)
+        : 4;
+
+    const docs = await equipmentCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .toArray();
+
+    const uploads = (await attachOwners(docs)).map((item) => ({
+        id: item.id,
+        name: item.name,
+        category: item.category,
+        location: item.location,
+        status: item.status,
+        image: item.image,
+        ownerName: item.owner?.name ?? "",
+        createdAt: item.createdAt ?? null,
+    }));
+
+    console.log("[Backend] recent uploads ->", uploads.length, "item(s)");
+    res.json({ uploads });
+})
+
+// ---------------------------------------------------------------------------
 // Owner equipment API (backend only - no UI code lives here)
 // The client sends the owner id in the URL; we verify it against the user
 // collection before touching any equipment or rental data.
@@ -60,6 +91,97 @@ function toRental(doc) {
     const { _id, ...fields } = doc;
     return { ...fields, id: _id.toHexString() };
 }
+
+/** Add owner info to equipment documents for the shared browse/details feeds. */
+async function attachOwners(docs) {
+    const ownerIds = [...new Set(
+        docs.map((doc) => doc.ownerId?.toString())
+            .filter((id) => id && ObjectId.isValid(id))
+    )];
+    const ownerDocs = ownerIds.length
+        ? await users.find({ _id: { $in: ownerIds.map((id) => new ObjectId(id)) } }).toArray()
+        : [];
+    const owners = new Map(ownerDocs.map((user) => [
+        user._id.toHexString(),
+        {
+            id: user._id.toHexString(),
+            name: user.name ?? "",
+            email: user.email ?? "",
+            phone: user.phone ?? "",
+            company: user.company ?? "",
+        },
+    ]));
+
+    return docs.map((doc) => toEquipment(doc, owners.get(doc.ownerId?.toString()) ?? {
+        id: doc.ownerId?.toString() ?? "",
+        name: "", email: "", phone: "", company: "",
+    }));
+}
+
+function escapeRegex(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseBound(value) {
+    if (value === undefined || value === null || value === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+const browseSorts = {
+    price_asc: { rentalPrice: 1, createdAt: -1 },
+    price_desc: { rentalPrice: -1, createdAt: -1 },
+    recent: { createdAt: -1 },
+};
+
+// ---------------------------------------------------------------------------
+// Public browse API. All listings are returned regardless of status; all
+// search, filters and sorting are applied by MongoDB here, not in the browser.
+// ---------------------------------------------------------------------------
+app.get('/equipment', async (req, res) => {
+    const query = {};
+
+    const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+    if (search) {
+        const pattern = new RegExp(escapeRegex(search), "i");
+        query.$or = [{ name: pattern }, { location: pattern }];
+    }
+
+    if (typeof req.query.category === "string" && req.query.category) {
+        query.category = req.query.category;
+    }
+    if (["Daily", "Weekly", "Monthly"].includes(req.query.rentalType)) {
+        query.rentalType = req.query.rentalType;
+    }
+
+    const min = parseBound(req.query.minPrice);
+    const max = parseBound(req.query.maxPrice);
+    if (min !== null || max !== null) {
+        query.rentalPrice = {};
+        if (min !== null) query.rentalPrice.$gte = min;
+        if (max !== null) query.rentalPrice.$lte = max;
+    }
+
+    if (req.query.availability === "available") query.availableQuantity = { $gt: 0 };
+    if (req.query.availability === "unavailable") query.availableQuantity = { $lte: 0 };
+
+    const sort = browseSorts[req.query.sort] ?? browseSorts.recent;
+    const docs = await equipmentCollection.find(query).sort(sort).toArray();
+    console.log("[Backend] browse equipment ->", docs.length, "item(s)");
+    res.json({ equipment: await attachOwners(docs) });
+})
+
+// Full details of one listing. Access is restricted in the UI to signed-in users.
+app.get('/equipment/:id', async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({ error: "Invalid equipment id." });
+    }
+    const doc = await equipmentCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).json({ error: "Equipment not found." });
+
+    const [equipment] = await attachOwners([doc]);
+    res.json({ equipment });
+})
 
 function readInput(body) {
     if (!body?.name?.trim() || !body.category || Number(body.rentalPrice) <= 0) {
@@ -243,13 +365,14 @@ async function checkCustomerId(req, res, next) {
     if (!ObjectId.isValid(customerId)) {
         return res.status(400).json({ error: "Invalid customer id." });
     }
-    const user = await users.findOne({ _id: new ObjectId(customerId), role: "customer" });
+    // Any signed-in user may save equipment and make a booking from browse.
+    const user = await users.findOne({ _id: new ObjectId(customerId) });
     if (!user) {
-        console.warn("[Backend] customer not found");
-        return res.status(403).json({ error: "Customer not found." });
+        console.warn("[Backend] user not found");
+        return res.status(403).json({ error: "User not found." });
     }
     req.customerId = customerId;
-    console.log("[Backend] customer verified:", user.email);
+    console.log("[Backend] user verified:", user.email);
     next();
 }
 
@@ -269,6 +392,46 @@ app.get('/customer/:customerId/rentals', checkCustomerId, async (req, res) => {
     res.json({ rentals: docs.map(toCustomerRental) });
 });
 
+// Create a booking from the equipment details page.
+app.post('/customer/:customerId/rentals', checkCustomerId, async (req, res) => {
+    const { equipmentId, rentalStartDate, rentalEndDate, requiredQuantity } = req.body ?? {};
+
+    if (!ObjectId.isValid(equipmentId) || !rentalStartDate || !rentalEndDate) {
+        return res.status(400).json({ error: "Select equipment and both rental dates." });
+    }
+
+    const start = new Date(rentalStartDate);
+    const end = new Date(rentalEndDate);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
+        return res.status(400).json({ error: "The end date must be on or after the start date." });
+    }
+
+    const equipment = await equipmentCollection.findOne({ _id: new ObjectId(equipmentId) });
+    if (!equipment) return res.status(404).json({ error: "Equipment not found." });
+
+    const quantity = Math.max(1, Math.floor(Number(requiredQuantity) || 1));
+    if (quantity > Number(equipment.availableQuantity ?? 0)) {
+        return res.status(400).json({ error: "The requested quantity is not available." });
+    }
+
+    const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86_400_000) + 1);
+    const doc = {
+        customerId: req.customerId,
+        equipmentId: String(equipmentId),
+        equipmentName: equipment.name ?? "",
+        equipmentImage: equipment.image ?? "",
+        rentalStartDate: start.toISOString(),
+        rentalEndDate: end.toISOString(),
+        bookingDate: new Date().toISOString(),
+        totalAmount: days * Number(equipment.rentalPrice) * quantity,
+        paymentStatus: "Pending",
+        bookingStatus: "Pending",
+    };
+    const result = await rentalsCollection.insertOne(doc);
+    console.log("[Backend] booking created:", result.insertedId.toHexString());
+    res.status(201).json({ rental: toCustomerRental({ ...doc, _id: result.insertedId }) });
+});
+
 // Favorite equipment of this customer, joined with the equipment records.
 app.get('/customer/:customerId/favorites', checkCustomerId, async (req, res) => {
     console.log("[Backend] GET customer favorites");
@@ -284,6 +447,15 @@ app.get('/customer/:customerId/favorites', checkCustomerId, async (req, res) => 
     const docs = await equipmentCollection.find({ _id: { $in: ids } }).toArray();
     console.log("[Backend] favorites ->", docs.length, "item(s)");
     res.json({ favorites: docs.map((doc) => toEquipment(doc, null)) });
+});
+
+// Whether a listing is already in this user's favorites.
+app.get('/customer/:customerId/favorites/:equipmentId', checkCustomerId, async (req, res) => {
+    const favorite = await favoritesCollection.findOne({
+        customerId: req.customerId,
+        equipmentId: req.params.equipmentId,
+    });
+    res.json({ isFavorite: Boolean(favorite) });
 });
 
 // Add a favorite (kept here so the favorites table can be populated).
@@ -311,6 +483,186 @@ app.delete('/customer/:customerId/favorites/:equipmentId', checkCustomerId, asyn
         return res.status(404).json({ error: "Favorite not found." });
     }
     res.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
+// Admin API. Every route verifies that the caller is an admin user.
+// ---------------------------------------------------------------------------
+
+async function checkAdminId(req, res, next) {
+    const adminId = req.params.adminId;
+    console.log("[Backend] checking admin id:", adminId);
+
+    if (!ObjectId.isValid(adminId)) {
+        return res.status(400).json({ error: "Invalid admin id." });
+    }
+    const admin = await users.findOne({ _id: new ObjectId(adminId), role: "admin" });
+    if (!admin) {
+        console.warn("[Backend] admin not found");
+        return res.status(403).json({ error: "Admin access required." });
+    }
+    req.adminId = adminId;
+    next();
+}
+
+function toAdminUser(user) {
+    return {
+        id: user._id.toHexString(),
+        name: user.name ?? "",
+        email: user.email ?? "",
+        role: user.role ?? "customer",
+        createdAt: user.createdAt ?? null,
+        phone: user.phone ?? "",
+        image: user.image ?? "",
+    };
+}
+
+const ADMIN_ROLES = ["customer", "owner", "admin"];
+const PAYMENT_STATUSES = ["Paid", "Pending", "Failed", "Refunded"];
+const BOOKING_STATUSES = ["Pending", "Confirmed", "Active", "Completed", "Cancelled"];
+
+// Users: list, change role, remove account.
+app.get('/admin/:adminId/users', checkAdminId, async (req, res) => {
+    const docs = await users.find({}).sort({ createdAt: -1 }).toArray();
+    console.log("[Backend] admin users ->", docs.length);
+    res.json({ users: docs.map(toAdminUser) });
+});
+
+app.patch('/admin/:adminId/users/:userId', checkAdminId, async (req, res) => {
+    const userId = req.params.userId;
+    const role = req.body?.role;
+    if (!ObjectId.isValid(userId) || !ADMIN_ROLES.includes(role)) {
+        return res.status(400).json({ error: "A valid role is required." });
+    }
+    const result = await users.updateOne(
+        { _id: new ObjectId(userId) },
+        { $set: { role, updatedAt: new Date() } }
+    );
+    if (!result.matchedCount) return res.status(404).json({ error: "User not found." });
+    const user = await users.findOne({ _id: new ObjectId(userId) });
+    console.log("[Backend] role updated:", userId, "->", role);
+    res.json({ user: toAdminUser(user) });
+});
+
+app.delete('/admin/:adminId/users/:userId', checkAdminId, async (req, res) => {
+    const userId = req.params.userId;
+    if (!ObjectId.isValid(userId)) {
+        return res.status(400).json({ error: "Invalid user id." });
+    }
+    if (userId === req.adminId) {
+        return res.status(400).json({ error: "You cannot delete your own account." });
+    }
+    const result = await users.deleteOne({ _id: new ObjectId(userId) });
+    if (!result.deletedCount) return res.status(404).json({ error: "User not found." });
+    await favoritesCollection.deleteMany({ customerId: userId });
+    console.log("[Backend] user deleted:", userId);
+    res.json({ success: true });
+});
+
+// Equipment: approve/reject, edit and delete any listing.
+app.get('/admin/:adminId/equipment', checkAdminId, async (req, res) => {
+    const docs = await equipmentCollection.find({}).sort({ createdAt: -1 }).toArray();
+    console.log("[Backend] admin equipment ->", docs.length);
+    res.json({ equipment: await attachOwners(docs) });
+});
+
+app.patch('/admin/:adminId/equipment/:id/status', checkAdminId, async (req, res) => {
+    const status = req.body?.status;
+    if (!ObjectId.isValid(req.params.id) || !["Pending", "Approved", "Rejected"].includes(status)) {
+        return res.status(400).json({ error: "A valid status is required." });
+    }
+    const result = await equipmentCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status } }
+    );
+    if (!result.matchedCount) return res.status(404).json({ error: "Equipment not found." });
+    console.log("[Backend] equipment status:", req.params.id, "->", status);
+    const doc = await equipmentCollection.findOne({ _id: new ObjectId(req.params.id) });
+    const [equipment] = await attachOwners([doc]);
+    res.json({ equipment });
+});
+
+app.patch('/admin/:adminId/equipment/:id', checkAdminId, async (req, res) => {
+    const patch = readPatch(req.body);
+    if (!ObjectId.isValid(req.params.id) || Object.keys(patch).length === 0) {
+        return res.status(400).json({ error: "No editable fields were provided." });
+    }
+    const result = await equipmentCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: patch }
+    );
+    if (!result.matchedCount) return res.status(404).json({ error: "Equipment not found." });
+    const doc = await equipmentCollection.findOne({ _id: new ObjectId(req.params.id) });
+    const [equipment] = await attachOwners([doc]);
+    res.json({ equipment });
+});
+
+app.delete('/admin/:adminId/equipment/:id', checkAdminId, async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({ error: "Invalid equipment id." });
+    }
+    const result = await equipmentCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+    if (!result.deletedCount) return res.status(404).json({ error: "Equipment not found." });
+    await favoritesCollection.deleteMany({ equipmentId: req.params.id });
+    await rentalsCollection.deleteMany({ equipmentId: req.params.id });
+    console.log("[Backend] equipment deleted by admin:", req.params.id);
+    res.json({ success: true });
+});
+
+// Rentals: all bookings with customer/owner details, plus status management.
+app.get('/admin/:adminId/rentals', checkAdminId, async (req, res) => {
+    const docs = await rentalsCollection.find({}).sort({ bookingDate: -1 }).toArray();
+    const ids = (field) => [...new Set(
+        docs.map((doc) => doc[field]?.toString()).filter((id) => id && ObjectId.isValid(id))
+    )];
+    const equipmentIds = ids("equipmentId");
+    const userIds = ids("customerId");
+
+    const equipmentDocs = equipmentIds.length
+        ? await equipmentCollection.find({ _id: { $in: equipmentIds.map((id) => new ObjectId(id)) } }).toArray()
+        : [];
+    const ownerIds = [...new Set(equipmentDocs.map((item) => item.ownerId?.toString()).filter(Boolean))];
+    const allUserIds = [...new Set([...userIds, ...ownerIds])].filter((id) => ObjectId.isValid(id));
+    const userDocs = allUserIds.length
+        ? await users.find({ _id: { $in: allUserIds.map((id) => new ObjectId(id)) } }).toArray()
+        : [];
+
+    const equipmentMap = new Map(equipmentDocs.map((item) => [item._id.toHexString(), item]));
+    const userMap = new Map(userDocs.map((user) => [user._id.toHexString(), user]));
+
+    const rentals = docs.map((doc) => {
+        const equipment = equipmentMap.get(doc.equipmentId?.toString());
+        const customer = userMap.get(doc.customerId?.toString());
+        const owner = equipment?.ownerId ? userMap.get(equipment.ownerId.toString()) : null;
+        return {
+            ...toRental(doc),
+            customerName: customer?.name ?? "",
+            customerEmail: customer?.email ?? "",
+            ownerId: equipment?.ownerId?.toString() ?? "",
+            ownerName: owner?.name ?? "",
+            ownerEmail: owner?.email ?? "",
+        };
+    });
+    console.log("[Backend] admin rentals ->", rentals.length);
+    res.json({ rentals });
+});
+
+app.patch('/admin/:adminId/rentals/:id', checkAdminId, async (req, res) => {
+    const patch = {};
+    if (PAYMENT_STATUSES.includes(req.body?.paymentStatus)) patch.paymentStatus = req.body.paymentStatus;
+    if (BOOKING_STATUSES.includes(req.body?.bookingStatus)) patch.bookingStatus = req.body.bookingStatus;
+
+    if (!ObjectId.isValid(req.params.id) || Object.keys(patch).length === 0) {
+        return res.status(400).json({ error: "No valid status fields were provided." });
+    }
+    const result = await rentalsCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: patch }
+    );
+    if (!result.matchedCount) return res.status(404).json({ error: "Rental not found." });
+    const doc = await rentalsCollection.findOne({ _id: new ObjectId(req.params.id) });
+    console.log("[Backend] rental updated:", req.params.id);
+    res.json({ rental: toRental(doc) });
 });
 
 // ---------------------------------------------------------------------------
