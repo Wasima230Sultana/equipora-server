@@ -2,10 +2,11 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
-
+import Stripe from 'stripe'
 const app = express();
 const port = process.env.PORT || 5000;
 
+const stripe = new Stripe (process.env.STRIPE_SECRET_KEY)
 // middleware
 app.use(express.json());
 app.use(cors());
@@ -33,6 +34,14 @@ const favoritesCollection = database.collection("favorites");
 const PAYMENT_STATUSES = ["Paid", "Pending", "Failed", "Refunded"];
 const BOOKING_STATUSES = ["Pending", "Confirmed", "Active", "Completed", "Cancelled"];
 
+// Admin-rejected listings are hidden from customer-facing endpoints.
+// Owner and admin management views keep showing them so they can be fixed/reviewed.
+const HIDDEN_EQUIPMENT_STATUS = "Rejected";
+const visibleEquipmentQuery = (query = {}) => ({
+    ...query,
+    status: { $ne: HIDDEN_EQUIPMENT_STATUS },
+});
+
 app.get('/', (req, res) => {
     res.send('equipora is looping')
 })
@@ -54,7 +63,7 @@ app.get('/equipment/recent', async (req, res) => {
         : 4;
 
     const docs = await equipmentCollection
-        .find({})
+        .find(visibleEquipmentQuery())
         .sort({ createdAt: -1 })
         .limit(limit)
         .toArray();
@@ -139,11 +148,11 @@ const browseSorts = {
 };
 
 // ---------------------------------------------------------------------------
-// Public browse API. All listings are returned regardless of status; all
-// search, filters and sorting are applied by MongoDB here, not in the browser.
+// Public browse API. Admin-rejected listings are excluded; all other search,
+// filters and sorting are applied by MongoDB here, not in the browser.
 // ---------------------------------------------------------------------------
 app.get('/equipment', async (req, res) => {
-    const query = {};
+    const query = visibleEquipmentQuery();
 
     const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
     if (search) {
@@ -198,7 +207,9 @@ app.get('/equipment/:id', async (req, res) => {
     if (!ObjectId.isValid(req.params.id)) {
         return res.status(400).json({ error: "Invalid equipment id." });
     }
-    const doc = await equipmentCollection.findOne({ _id: new ObjectId(req.params.id) });
+    const doc = await equipmentCollection.findOne(
+        visibleEquipmentQuery({ _id: new ObjectId(req.params.id) })
+    );
     if (!doc) return res.status(404).json({ error: "Equipment not found." });
 
     const [equipment] = await attachOwners([doc]);
@@ -429,7 +440,9 @@ app.post('/customer/:customerId/rentals', checkCustomerId, async (req, res) => {
     }
 
     const equipment = await equipmentCollection.findOne({ _id: new ObjectId(equipmentId) });
-    if (!equipment) return res.status(404).json({ error: "Equipment not found." });
+    if (!equipment || equipment.status === HIDDEN_EQUIPMENT_STATUS) {
+        return res.status(404).json({ error: "Equipment not found." });
+    }
 
     const quantity = Math.max(1, Math.floor(Number(requiredQuantity) || 1));
     if (quantity > Number(equipment.availableQuantity ?? 0)) {
@@ -537,7 +550,9 @@ app.get('/customer/:customerId/favorites', checkCustomerId, async (req, res) => 
         console.log("[Backend] no favorites yet");
         return res.json({ favorites: [] });
     }
-    const docs = await equipmentCollection.find({ _id: { $in: ids } }).toArray();
+    const docs = await equipmentCollection
+        .find(visibleEquipmentQuery({ _id: { $in: ids } }))
+        .toArray();
     console.log("[Backend] favorites ->", docs.length, "item(s)");
     res.json({ favorites: docs.map((doc) => toEquipment(doc, null)) });
 });
