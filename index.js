@@ -26,6 +26,7 @@ export async function connectToMongoDB() {
 const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("equipora");
 const users = database.collection("user");
+const sessions = database.collection("session");
 const equipmentCollection = database.collection("equipment");
 const rentalsCollection = database.collection("rentals");
 const favoritesCollection = database.collection("favorites");
@@ -37,6 +38,40 @@ const BOOKING_STATUSES = ["Pending", "Confirmed", "Active", "Completed", "Cancel
 // Admin-rejected listings are hidden from customer-facing endpoints.
 // Owner and admin management views keep showing them so they can be fixed/reviewed.
 const HIDDEN_EQUIPMENT_STATUS = "Rejected";
+
+
+const verifyToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+
+    const query = { token };
+    const session = await sessions.findOne(query);
+    if (!session) {
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+
+    const userId = session.userId;
+
+    const userQuery = { _id: new ObjectId(userId) };
+    const user = await users.findOne(userQuery);
+    if (!user) {
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+
+    req.user = user;
+    next();
+}
+
 const visibleEquipmentQuery = (query = {}) => ({
     ...query,
     status: { $ne: HIDDEN_EQUIPMENT_STATUS },
@@ -203,7 +238,7 @@ app.get('/equipment/featured', async (req, res) => {
 })
 
 // Full details of one listing. Access is restricted in the UI to signed-in users.
-app.get('/equipment/:id', async (req, res) => {
+app.get('/equipment/:id',verifyToken, async (req, res) => {
     if (!ObjectId.isValid(req.params.id)) {
         return res.status(400).json({ error: "Invalid equipment id." });
     }
